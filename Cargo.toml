@@ -1,6 +1,6 @@
 [package]
 name = "loudtrace"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.95"
 description = "A standalone loudness analyzer with Spotify Normal reference predictions"
@@ -22,6 +22,9 @@ rubato = "0.16.2"
 
 [dev-dependencies]
 hound = "3.5"
+
+[build-dependencies]
+winresource = "0.1.34"
 
 [profile.release]
 lto = "thin"

@@ -18,6 +18,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("LoudTrace")
+            // Linux desktops match the window to loudtrace.desktop and its icon.
+            .with_app_id("loudtrace")
             .with_inner_size([1120.0, 760.0])
             .with_min_inner_size([900.0, 600.0])
             .with_icon(ui_style::app_icon()),

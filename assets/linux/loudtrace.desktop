@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LoudTrace
+GenericName=Loudness Analyzer
+Comment=Measure track and album loudness and preview streaming normalization
+Exec=loudtrace
+Icon=loudtrace
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupWMClass=loudtrace

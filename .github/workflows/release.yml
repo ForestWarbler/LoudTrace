@@ -35,6 +35,11 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup update stable --no-self-update && rustup default stable
       - run: cargo build --release --locked
+      - name: Check the embedded icon and product details
+        shell: pwsh
+        run: |
+          $info = (Get-Item target/release/loudtrace.exe).VersionInfo
+          if ($info.ProductName -ne "LoudTrace") { throw "loudtrace.exe has no embedded resources." }
       - name: Package
         shell: pwsh
         run: |
@@ -57,7 +62,11 @@ jobs:
       - run: rustup update stable --no-self-update && rustup default stable
       - run: cargo build --release --locked
       - name: Package
-        run: tar -czf "LoudTrace-$GITHUB_REF_NAME-linux-x86_64.tar.gz" -C target/release loudtrace
+        run: |
+          package="LoudTrace-$GITHUB_REF_NAME-linux-x86_64"
+          mkdir "$package"
+          cp target/release/loudtrace assets/linux/loudtrace.desktop assets/icons/loudtrace.png "$package/"
+          tar -czf "$package.tar.gz" "$package"
       - uses: actions/upload-artifact@v7
         with:
           name: linux
@@ -93,7 +102,7 @@ jobs:
 
           - **macOS 11 or later** (Apple silicon and Intel): unzip and move LoudTrace.app to Applications. The app is not notarized, so on first launch Control-click it and choose **Open**.
           - **Windows 10 or later** (x86_64): unzip and run LoudTrace.exe. If SmartScreen warns about an unrecognized app, choose **More info** and then **Run anyway**.
-          - **Linux** (x86_64): extract and run `loudtrace`. Requires the ALSA runtime library (`libasound2`).
+          - **Linux** (x86_64): extract and run `loudtrace`. Requires the ALSA runtime library (`libasound2`). To add LoudTrace to your app menu with its icon, copy `loudtrace` to `~/.local/bin`, `loudtrace.desktop` to `~/.local/share/applications`, and `loudtrace.png` to `~/.local/share/icons/hicolor/512x512/apps`.
 
           `SHA256SUMS.txt` lists checksums for every download.
           NOTES

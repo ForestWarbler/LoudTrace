@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.1
+
+### Fixed
+
+- The app icon now appears before LoudTrace is opened: in Finder, Launchpad and the Dock on macOS, and in Explorer, the Start menu and shortcuts on Windows. Previously it appeared only while the app was running.
+- On Windows, Task Manager and the file's properties show LoudTrace as the product name.
+- The Linux download includes a desktop entry and an icon, and the window now identifies itself so the desktop can match it to them.
+
 ## v1.0.0
 
 The first stable release of LoudTrace, a desktop app for checking track and album loudness and hearing how a streaming service would normalize it.

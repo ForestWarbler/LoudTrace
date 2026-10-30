@@ -534,7 +534,18 @@ pub fn paint_logo(painter: &Painter, rect: Rect, bars: Color32, bounds: Color32)
 /// Rasterised app icon (dock / taskbar), drawn from the same geometry as the mark.
 pub fn app_icon() -> egui::IconData {
     const SIZE: u32 = 256;
-    let size = SIZE as f32;
+    egui::IconData {
+        rgba: app_icon_rgba(SIZE),
+        width: SIZE,
+        height: SIZE,
+    }
+}
+
+/// RGBA pixels of the app icon at `size` × `size`. The packaged icon files in
+/// assets/icons are exported from this drawing.
+fn app_icon_rgba(size: u32) -> Vec<u8> {
+    let pixels = size;
+    let size = pixels as f32;
     let center = size / 2.0;
     // macOS icon grid: an 824/1024 body with a 185/1024 corner radius.
     let half = size * 824.0 / 1024.0 / 2.0;
@@ -547,11 +558,13 @@ pub fn app_icon() -> egui::IconData {
     let rgb = |c: Color32| [c.r() as f32, c.g() as f32, c.b() as f32];
     type Capsule = ((f32, f32), (f32, f32), f32, [f32; 3]);
     let mut capsules: Vec<Capsule> = Vec::new();
+    // Like the in-app logo, small sizes use heavier strokes to stay legible.
+    let (bound_width, bar_width) = if size < 40.0 { (4.0, 5.0) } else { (3.5, 4.5) };
     for y in MARK_BOUNDS {
         capsules.push((
             (to_px(10.0), to_px(y)),
             (to_px(54.0), to_px(y)),
-            3.5 * unit / 2.0,
+            bound_width * unit / 2.0,
             rgb(ACCENT),
         ));
     }
@@ -559,7 +572,7 @@ pub fn app_icon() -> egui::IconData {
         capsules.push((
             (to_px(x), to_px(32.0 - h)),
             (to_px(x), to_px(32.0 + h)),
-            4.5 * unit / 2.0,
+            bar_width * unit / 2.0,
             rgb(INK),
         ));
     }
@@ -574,9 +587,9 @@ pub fn app_icon() -> egui::IconData {
         let h = ((pax * bax + pay * bay) / (bax * bax + bay * bay).max(1e-6)).clamp(0.0, 1.0);
         (pax - bax * h).hypot(pay - bay * h)
     };
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
+    let mut rgba = vec![0u8; (pixels * pixels * 4) as usize];
+    for y in 0..pixels {
+        for x in 0..pixels {
             let p = (x as f32 + 0.5, y as f32 + 0.5);
             // Premultiplied accumulation: [r, g, b, a].
             let mut out = [0.0f32; 4];
@@ -600,7 +613,7 @@ pub fn app_icon() -> egui::IconData {
                     (0.5 - (segment(p, *a, *b) - r)).clamp(0.0, 1.0) * inside,
                 );
             }
-            let index = ((y * SIZE + x) * 4) as usize;
+            let index = ((y * pixels + x) * 4) as usize;
             if out[3] > 0.0 {
                 for i in 0..3 {
                     rgba[index + i] = (out[i] / out[3]).round().clamp(0.0, 255.0) as u8;
@@ -609,11 +622,7 @@ pub fn app_icon() -> egui::IconData {
             }
         }
     }
-    egui::IconData {
-        rgba,
-        width: SIZE,
-        height: SIZE,
-    }
+    rgba
 }
 
 /// Style a child ui for a flat slider: 4 px rail, accent fill. Pair with [`paint_slider_handle`].

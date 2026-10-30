@@ -26,8 +26,9 @@ esac
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
 bundle="target/$profile/LoudTrace.app"
 rm -rf "$bundle"
-mkdir -p "$bundle/Contents/MacOS"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp "target/$profile/loudtrace" "$bundle/Contents/MacOS/loudtrace"
+cp assets/icons/AppIcon.icns "$bundle/Contents/Resources/AppIcon.icns"
 cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -37,6 +38,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>LoudTrace</string>
     <key>CFBundleDisplayName</key><string>LoudTrace</string>
     <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleShortVersionString</key><string>$version</string>
     <key>CFBundleVersion</key><string>$version</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
