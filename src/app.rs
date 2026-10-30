@@ -1,6 +1,6 @@
 use crate::track_drag::{self, TrackDrag};
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Stroke, Vec2};
-use loudtrace::audio::{self, BatchAnalysis};
+use loudtrace::audio::{self, AlbumMeasurement, Measurement, TrackAnalysis};
 use loudtrace::playback::{Playback, PlaybackState};
 use loudtrace::policy::normal_gain;
 use loudtrace::project::{
@@ -22,14 +22,71 @@ use crate::ui_style::{
     paint_slider_handle, play_button, style_slider,
 };
 
+// One track's analysis. It describes the track only while the track still
+// points at `path` and the file still matches `stamp`.
+#[derive(Debug)]
+struct TrackResult {
+    path: PathBuf,
+    stamp: Option<FileStamp>,
+    analysis: Result<TrackAnalysis, String>,
+}
+
+// Tracks are analyzed independently and keyed by ID, so editing, reordering, or
+// changing one track never discards the others. The album is derived from them.
+#[derive(Debug, Default)]
 struct Report {
-    batch: BatchAnalysis,
-    stamps: Vec<Option<FileStamp>>,
+    tracks: HashMap<Uuid, TrackResult>,
+    // None while any track still needs analysis.
+    album: Option<Result<AlbumMeasurement, String>>,
+}
+
+impl Report {
+    fn result(&self, track: &Track) -> Option<&Result<TrackAnalysis, String>> {
+        self.tracks
+            .get(&track.id)
+            .filter(|result| result.path == track.path)
+            .map(|result| &result.analysis)
+    }
+
+    fn measurement(&self, track: &Track) -> Option<&Measurement> {
+        let analysis = self.result(track)?.as_ref().ok()?;
+        Some(&analysis.measurement)
+    }
+
+    // Drops results for removed or relinked tracks, then pools the album again.
+    fn sync(&mut self, project: &Project) {
+        self.tracks.retain(|id, result| {
+            project
+                .tracks
+                .iter()
+                .any(|track| track.id == *id && track.path == result.path)
+        });
+        self.album = self.pooled_album(project);
+    }
+
+    fn pooled_album(&self, project: &Project) -> Option<Result<AlbumMeasurement, String>> {
+        if project.tracks.is_empty() {
+            return None;
+        }
+        let mut analyses = Vec::with_capacity(project.tracks.len());
+        let mut failed = false;
+        for track in &project.tracks {
+            match self.result(track)? {
+                Ok(analysis) => analyses.push(analysis),
+                Err(_) => failed = true,
+            }
+        }
+        Some(if failed {
+            Err("Every track must be analyzed successfully before calculating the album.".into())
+        } else {
+            audio::album_measurement(analyses)
+        })
+    }
 }
 
 enum WorkerEvent {
-    Progress(usize, usize),
-    Finished(Report),
+    Track(Uuid, Box<TrackResult>),
+    Finished,
 }
 
 struct Worker {
@@ -179,7 +236,7 @@ impl LoudTraceApp {
         }
     }
 
-    fn edit_project(&mut self, edit: impl FnOnce(&mut Project), invalidate: bool) {
+    fn edit_project(&mut self, edit: impl FnOnce(&mut Project)) {
         if !self.editable() {
             return;
         }
@@ -189,10 +246,26 @@ impl LoudTraceApp {
                     edit(project);
                 }
             });
-            if committed && invalidate {
-                self.reports.remove(&id);
-                self.stop_playback();
+            if committed {
+                // Untouched tracks keep their results; the album gain may change.
+                self.sync_report(id);
+                self.sync_playback_gain();
             }
+        }
+    }
+
+    // Re-pairs a project's results with its current tracks. A report with no
+    // results left is removed, so it again reads as "Ready to analyze".
+    fn sync_report(&mut self, project_id: Uuid) {
+        let project = self.library.projects.iter().find(|p| p.id == project_id);
+        let Some(report) = self.reports.get_mut(&project_id) else {
+            return;
+        };
+        if let Some(project) = project {
+            report.sync(project);
+        }
+        if project.is_none() || report.tracks.is_empty() {
+            self.reports.remove(&project_id);
         }
     }
 
@@ -200,17 +273,14 @@ impl LoudTraceApp {
         if paths.is_empty() {
             return;
         }
-        self.edit_project(
-            |project| {
-                for path in paths {
-                    // Repeated imports should not accidentally count one file twice in an album.
-                    if !project.tracks.iter().any(|track| track.path == path) {
-                        project.tracks.push(Track::new(path));
-                    }
+        self.edit_project(|project| {
+            for path in paths {
+                // Repeated imports should not accidentally count one file twice in an album.
+                if !project.tracks.iter().any(|track| track.path == path) {
+                    project.tracks.push(Track::new(path));
                 }
-            },
-            true,
-        );
+            }
+        });
     }
 
     fn move_track(&mut self, track_id: Uuid, delta: isize) {
@@ -243,7 +313,6 @@ impl LoudTraceApp {
         let Some(index) = project.tracks.iter().position(|track| track.id == track_id) else {
             return;
         };
-        let track_count = project.tracks.len();
         let target = match insert_before {
             Some(target_id) => {
                 let Some(target) = project
@@ -255,36 +324,21 @@ impl LoudTraceApp {
                 };
                 target
             }
-            None => track_count,
+            None => project.tracks.len(),
         };
         // Removing an earlier track shifts the insertion boundary one position left.
         let destination = target - usize::from(index < target);
         if destination == index {
             return;
         }
-        if !self.commit(|library| {
+        // Results and playback follow track IDs, and pooled album loudness is
+        // independent of order, so reordering leaves every result in place.
+        self.commit(|library| {
             if let Some(project) = library.projects.iter_mut().find(|p| p.id == project_id) {
                 let track = project.tracks.remove(index);
                 project.tracks.insert(destination, track);
             }
-        }) {
-            return;
-        }
-
-        if let Some(report) = self.reports.get_mut(&project_id) {
-            if report.batch.tracks.len() == track_count && report.stamps.len() == track_count {
-                // Measurements and source stamps follow the same permutation as the tracks.
-                // Pooled album loudness is independent of order; playback follows track IDs.
-                let measurement = report.batch.tracks.remove(index);
-                report.batch.tracks.insert(destination, measurement);
-                let stamp = report.stamps.remove(index);
-                report.stamps.insert(destination, stamp);
-            } else {
-                // Discard inconsistent data rather than associate a result with the wrong file.
-                self.reports.remove(&project_id);
-                self.stop_playback();
-            }
-        }
+        });
     }
 
     fn start_analysis(&mut self, ctx: &egui::Context) {
@@ -294,44 +348,61 @@ impl LoudTraceApp {
         let Some(project) = self.project() else {
             return;
         };
-        if project.tracks.is_empty() {
+        let id = project.id;
+        // Measure only tracks without a current result; failed tracks are
+        // retried. When every track is current, measure all of them again.
+        let mut queue: Vec<_> = unmeasured(self.reports.get(&id), project)
+            .map(|t| (t.id, t.path.clone()))
+            .collect();
+        if queue.is_empty() {
+            queue = project
+                .tracks
+                .iter()
+                .map(|t| (t.id, t.path.clone()))
+                .collect();
+        }
+        if queue.is_empty() {
             return;
         }
-        let id = project.id;
-        let paths: Vec<_> = project.tracks.iter().map(|t| t.path.clone()).collect();
-        let total = paths.len();
-        self.stop_playback();
-        self.reports.remove(&id);
+        let total = queue.len();
         if !self.read_only {
             self.notice = None;
         }
+        // Queued tracks read as pending until their new result arrives.
+        if let Some(report) = self.reports.get_mut(&id) {
+            for (track_id, _) in &queue {
+                report.tracks.remove(track_id);
+            }
+        }
+        self.sync_report(id);
+        self.sync_playback_gain();
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled);
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let before: Vec<_> = paths.iter().map(|p| file_stamp(p).ok()).collect();
-            let mut batch = audio::analyze_files(
-                &paths,
-                |completed, total| {
-                    let _ = tx.send(WorkerEvent::Progress(completed, total));
-                    ctx.request_repaint();
-                },
-                &flag,
-            );
-            let after: Vec<_> = paths.iter().map(|p| file_stamp(p).ok()).collect();
-            // A result must belong to one stable set of files, including tracks read earlier.
-            for (index, (old, new)) in before.iter().zip(&after).enumerate() {
-                if old != new {
-                    batch.tracks[index] =
-                        Err("File changed during analysis. Analyze again.".into());
-                    batch.album = Err("A file changed during analysis. Analyze again.".into());
+            for (track_id, path) in queue {
+                // A result must describe one stable version of its file.
+                let before = file_stamp(&path).ok();
+                let analysis = audio::analyze_track(&path, &flag);
+                if flag.load(Ordering::Relaxed) {
+                    break;
                 }
+                let stamp = file_stamp(&path).ok();
+                let analysis = if stamp == before {
+                    analysis
+                } else {
+                    Err("File changed during analysis. Analyze again.".into())
+                };
+                let result = TrackResult {
+                    path,
+                    stamp,
+                    analysis,
+                };
+                let _ = tx.send(WorkerEvent::Track(track_id, Box::new(result)));
+                ctx.request_repaint();
             }
-            let _ = tx.send(WorkerEvent::Finished(Report {
-                batch,
-                stamps: after,
-            }));
+            let _ = tx.send(WorkerEvent::Finished);
             ctx.request_repaint();
         });
         self.worker = Some(Worker {
@@ -344,37 +415,46 @@ impl LoudTraceApp {
     }
 
     fn poll_worker(&mut self) {
-        let mut finished = None;
+        let Some(worker) = &mut self.worker else {
+            return;
+        };
+        let project_id = worker.project_id;
+        let mut results = Vec::new();
+        let mut finished = false;
         let mut disconnected = false;
-        if let Some(worker) = &mut self.worker {
-            loop {
-                match worker.rx.try_recv() {
-                    Ok(WorkerEvent::Progress(completed, total)) => {
-                        worker.completed = completed;
-                        worker.total = total;
-                    }
-                    Ok(WorkerEvent::Finished(report)) => {
-                        finished = Some((
-                            worker.project_id,
-                            report,
-                            worker.cancelled.load(Ordering::Relaxed),
-                        ));
-                        break;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
+        loop {
+            match worker.rx.try_recv() {
+                Ok(WorkerEvent::Track(track_id, result)) => {
+                    worker.completed += 1;
+                    results.push((track_id, *result));
+                }
+                Ok(WorkerEvent::Finished) => {
+                    finished = true;
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
                 }
             }
         }
-        if let Some((id, report, cancelled)) = finished {
+        let cancelled = worker.cancelled.load(Ordering::Relaxed);
+        // Each track is complete on its own, so results are kept as they
+        // arrive, including those finished before a cancellation.
+        if !results.is_empty() {
+            self.reports
+                .entry(project_id)
+                .or_default()
+                .tracks
+                .extend(results);
+            self.sync_report(project_id);
+        }
+        if finished {
             self.worker = None;
             if cancelled {
-                self.notice = Some("Analysis cancelled. No partial results were kept.".into());
-            } else {
-                self.reports.insert(id, report);
+                self.notice =
+                    Some("Analysis cancelled. Tracks that finished keep their results.".into());
             }
         } else if disconnected {
             self.worker = None;
@@ -387,28 +467,30 @@ impl LoudTraceApp {
             return;
         }
         self.last_file_check = Instant::now();
-        let mut changed = Vec::new();
-        for project in &self.library.projects {
-            if let Some(report) = self.reports.get(&project.id) {
-                let stamps: Vec<_> = project
-                    .tracks
-                    .iter()
-                    .map(|t| file_stamp(&t.path).ok())
-                    .collect();
-                if report.stamps != stamps {
-                    changed.push(project.id);
-                }
-            }
-        }
-        for id in changed {
-            self.reports.remove(&id);
-            if self.audition.as_ref().is_some_and(|a| a.project_id == id) {
-                self.stop_playback();
-            }
-            if self.selected == Some(id) {
+        let ids: Vec<_> = self.reports.keys().copied().collect();
+        for id in ids {
+            if self.revalidate(id) && self.selected == Some(id) {
                 self.notice = Some("A source file changed or became unavailable. Analyze again to update the results.".into());
             }
         }
+    }
+
+    // Drops results whose source changed since it was analyzed; other tracks
+    // keep theirs. Returns whether any result was dropped.
+    fn revalidate(&mut self, project_id: Uuid) -> bool {
+        let Some(report) = self.reports.get_mut(&project_id) else {
+            return false;
+        };
+        let count = report.tracks.len();
+        report
+            .tracks
+            .retain(|_, result| file_stamp(&result.path).ok() == result.stamp);
+        if report.tracks.len() == count {
+            return false;
+        }
+        self.sync_report(project_id);
+        self.sync_playback_gain();
+        true
     }
 
     fn stop_playback(&mut self) {
@@ -418,39 +500,46 @@ impl LoudTraceApp {
     }
 
     fn start_playback(&mut self, track_id: Uuid) {
+        let Some(project_id) = self.selected else {
+            return;
+        };
+        // Check the sources now rather than waiting for the periodic check.
+        let changed = self.revalidate(project_id);
+        if changed {
+            self.notice = Some(
+                "A source file changed or became unavailable. Analyze again to update the results."
+                    .into(),
+            );
+        }
         let Some(project) = self.project() else {
             return;
         };
-        let Some(index) = project.tracks.iter().position(|t| t.id == track_id) else {
+        let Some(track) = project.tracks.iter().find(|t| t.id == track_id) else {
             return;
         };
-        let Some(report) = self.reports.get(&project.id) else {
-            self.notice =
-                Some("Analyze the files before listening to the normalized result.".into());
-            return;
-        };
-        let stamps: Vec<_> = project
-            .tracks
-            .iter()
-            .map(|t| file_stamp(&t.path).ok())
-            .collect();
-        if stamps != report.stamps {
-            let id = project.id;
+        let report = self.reports.get(&project_id);
+        let Some(gain_db) = report.and_then(|r| audition_gain(r, project.mode, track)) else {
+            let pending = report.is_none_or(|r| {
+                r.result(track).is_none()
+                    || (project.mode == AnalysisMode::Album && r.album.is_none())
+            });
             self.stop_playback();
-            self.reports.remove(&id);
-            self.notice = Some("A source file changed. Analyze again before listening.".into());
-            return;
-        }
-        let Some(gain_db) = audition_gain(report, project.mode, index) else {
-            self.stop_playback();
-            self.notice = Some("This track has no available normalization gain in the selected mode. Check the analysis result.".into());
-            return;
-        };
-        let Some(stamp) = report.stamps.get(index).and_then(Clone::clone) else {
+            self.notice = Some(if changed {
+                "A source file changed. Analyze again before listening.".into()
+            } else if pending {
+                "Analyze the files before listening to the normalized result.".into()
+            } else {
+                "This track has no available normalization gain in the selected mode. Check the analysis result.".into()
+            });
             return;
         };
-        let project_id = project.id;
-        let path = project.tracks[index].path.clone();
+        let Some(stamp) = report
+            .and_then(|r| r.tracks.get(&track_id))
+            .and_then(|r| r.stamp.clone())
+        else {
+            return;
+        };
+        let path = track.path.clone();
         self.playback
             .set_volume(if self.muted { 0.0 } else { self.monitor_volume });
         match self.playback.load(path, stamp, gain_db) {
@@ -462,7 +551,8 @@ impl LoudTraceApp {
                     track_id,
                     finished: false,
                 });
-                if !self.read_only {
+                // Keep the warning about another track's changed source.
+                if !self.read_only && !changed {
                     self.notice = None;
                 }
             }
@@ -507,27 +597,25 @@ impl LoudTraceApp {
         }
     }
 
-    fn sync_playback_gain(&mut self) {
+    // Re-applies the audition's gain from current results, or stops playback
+    // when none remains. Returns whether it stopped for lack of a gain.
+    fn sync_playback_gain(&mut self) -> bool {
         let Some(audition) = &self.audition else {
-            return;
+            return false;
         };
         let next_gain = self.project().and_then(|project| {
-            let index = project
-                .tracks
-                .iter()
-                .position(|t| t.id == audition.track_id)?;
-            audition_gain(self.reports.get(&project.id)?, project.mode, index)
+            let track = project.tracks.iter().find(|t| t.id == audition.track_id)?;
+            audition_gain(self.reports.get(&project.id)?, project.mode, track)
         });
-        if let Some(gain_db) = next_gain {
-            if let Err(error) = self.playback.set_gain_db(gain_db) {
-                self.stop_playback();
-                self.notice = Some(error);
-            }
-        } else {
+        let Some(gain_db) = next_gain else {
             self.stop_playback();
-            self.notice =
-                Some("Playback stopped: normalization is unavailable in this mode.".into());
+            return true;
+        };
+        if let Err(error) = self.playback.set_gain_db(gain_db) {
+            self.stop_playback();
+            self.notice = Some(error);
         }
+        false
     }
 
     fn poll_playback(&mut self) {
@@ -700,12 +788,20 @@ impl LoudTraceApp {
         let Some(report) = self.reports.get(&project.id) else {
             return ("Ready to analyze".into(), FAINT, DISABLED);
         };
-        let failed = report.batch.tracks.iter().filter(|r| r.is_err()).count();
+        let failed = project
+            .tracks
+            .iter()
+            .filter(|t| report.result(t).is_some_and(Result::is_err))
+            .count();
         if failed > 0 {
             return (attention(failed), WARNING, WARNING);
         }
+        let pending = unmeasured(Some(report), project).count();
+        if pending > 0 {
+            return (format!("{pending} to analyze"), FAINT, DISABLED);
+        }
         if project.mode == AnalysisMode::Album
-            && let Ok(album) = &report.batch.album
+            && let Some(Ok(album)) = &report.album
         {
             return (
                 format!(
@@ -952,11 +1048,10 @@ impl LoudTraceApp {
 
         let mut meta: Vec<(String, Color32)> = vec![(plural(track_count, "track"), MUTED)];
         if let Some(report) = report {
-            let total: f64 = report
-                .batch
+            let total: f64 = project
                 .tracks
                 .iter()
-                .filter_map(|r| r.as_ref().ok())
+                .filter_map(|t| report.measurement(t))
                 .map(|m| m.duration_seconds)
                 .sum();
             if total > 0.0 {
@@ -975,7 +1070,7 @@ impl LoudTraceApp {
         } else if track_count == 0 {
             meta.push(("No tracks yet".into(), MUTED));
         } else if let Some(report) = report {
-            let measured = report.batch.tracks.iter().filter(|r| r.is_ok()).count();
+            let measured = track_count - unmeasured(Some(report), project).count();
             meta.push(if measured == track_count {
                 ("All analyzed".into(), MUTED)
             } else {
@@ -988,12 +1083,11 @@ impl LoudTraceApp {
             let needs_attention = project
                 .tracks
                 .iter()
-                .enumerate()
-                .filter(|(index, track)| {
+                .filter(|track| {
                     !track.path.is_file()
                         || report
-                            .and_then(|r| r.batch.tracks.get(*index))
-                            .is_some_and(|r| r.is_err())
+                            .and_then(|r| r.result(track))
+                            .is_some_and(Result::is_err)
                 })
                 .count();
             if needs_attention > 0 {
@@ -1046,18 +1140,27 @@ impl LoudTraceApp {
             {
                 *action = Some(Action::Cancel);
             }
-        } else if button_at(
-            ui,
-            "analyze_action",
-            analyze_rect,
-            "Analyze",
-            None,
-            track_count > 0,
-            true,
-        )
-        .clicked()
-        {
-            *action = Some(Action::Analyze);
+        } else {
+            // With every track current, the same action measures all of them again.
+            let current = track_count > 0 && unmeasured(report, project).next().is_none();
+            if button_at(
+                ui,
+                "analyze_action",
+                analyze_rect,
+                if current { "Re-analyze" } else { "Analyze" },
+                None,
+                track_count > 0,
+                !current,
+            )
+            .on_hover_text(if current {
+                "Measure every track again."
+            } else {
+                "Measure tracks that are new, changed, or failed. Other tracks keep their results."
+            })
+            .clicked()
+            {
+                *action = Some(Action::Analyze);
+            }
         }
         let add_rect = egui::Rect::from_min_size(
             egui::pos2(analyze_rect.left() - 8.0 - 118.0, button_top),
@@ -1186,7 +1289,7 @@ impl LoudTraceApp {
                 )
                 .right();
             }
-            AnalysisMode::Album => match report.map(|r| &r.batch.album) {
+            AnalysisMode::Album => match report.and_then(|r| r.album.as_ref()) {
                 Some(Ok(album)) => {
                     let loudness = level(album.integrated_lufs);
                     let peak_text = peak(album.true_peak_dbtp);
@@ -1371,8 +1474,10 @@ impl LoudTraceApp {
             .filter(|a| a.project_id == project.id)
             .and_then(|a| project.tracks.iter().position(|t| t.id == a.track_id));
         let report = self.reports.get(&project.id);
-        let candidate = index.unwrap_or(0);
-        let gain_db = report.and_then(|r| audition_gain(r, project.mode, candidate));
+        let candidate = project.tracks.get(index.unwrap_or(0));
+        let gain_db = report
+            .zip(candidate)
+            .and_then(|(r, track)| audition_gain(r, project.mode, track));
         let ready = gain_db.is_some();
         let active = matches!(state, PlaybackState::Playing | PlaybackState::Paused);
         let session_id = self.audition.as_ref().map(|a| a.session_id);
@@ -1385,8 +1490,8 @@ impl LoudTraceApp {
             self.playback.duration().as_secs_f64()
         } else {
             report
-                .and_then(|r| r.batch.tracks.get(candidate))
-                .and_then(|m| m.as_ref().ok())
+                .zip(candidate)
+                .and_then(|(r, track)| r.measurement(track))
                 .map_or(0.0, |m| m.duration_seconds)
         };
         let mut position = self
@@ -1748,11 +1853,11 @@ impl LoudTraceApp {
                             Stroke::new(1.0, HAIRLINE),
                         );
 
-                        let result = report.and_then(|r| r.batch.tracks.get(index));
-                        let measurement = result.and_then(|r| r.as_ref().ok());
+                        let result = report.and_then(|r| r.result(track));
+                        let measurement = report.and_then(|r| r.measurement(track));
                         let missing = !track.path.is_file();
                         let applied_gain =
-                            report.and_then(|r| audition_gain(r, project.mode, index));
+                            report.and_then(|r| audition_gain(r, project.mode, track));
                         let output = measurement
                             .and_then(|m| m.integrated_lufs)
                             .zip(applied_gain)
@@ -2021,17 +2126,14 @@ impl LoudTraceApp {
             }
             Action::Replace(id) => {
                 if let Some(path) = audio_dialog().pick_file() {
-                    self.edit_project(
-                        |p| {
-                            if let Some(track) = p.tracks.iter_mut().find(|t| t.id == id) {
-                                track.path = path;
-                            }
-                        },
-                        true,
-                    );
+                    self.edit_project(|p| {
+                        if let Some(track) = p.tracks.iter_mut().find(|t| t.id == id) {
+                            track.path = path;
+                        }
+                    });
                 }
             }
-            Action::Remove(id) => self.edit_project(|p| p.tracks.retain(|t| t.id != id), true),
+            Action::Remove(id) => self.edit_project(|p| p.tracks.retain(|t| t.id != id)),
             Action::Move(id, delta) => self.move_track(id, delta),
             Action::Reorder {
                 project_id,
@@ -2047,8 +2149,10 @@ impl LoudTraceApp {
                             p.mode = mode;
                         }
                     })
+                    && self.sync_playback_gain()
                 {
-                    self.sync_playback_gain();
+                    self.notice =
+                        Some("Playback stopped: normalization is unavailable in this mode.".into());
                 }
             }
             Action::PlayTrack(id) => self.start_playback(id),
@@ -2254,12 +2358,23 @@ impl eframe::App for LoudTraceApp {
     }
 }
 
-fn audition_gain(report: &Report, mode: AnalysisMode, index: usize) -> Option<f64> {
-    let measurement = report.batch.tracks.get(index)?.as_ref().ok()?;
+// Tracks without a current measurement: new, relinked, changed, or failed.
+fn unmeasured<'a>(
+    report: Option<&'a Report>,
+    project: &'a Project,
+) -> impl Iterator<Item = &'a Track> {
+    project
+        .tracks
+        .iter()
+        .filter(move |track| report.and_then(|r| r.measurement(track)).is_none())
+}
+
+fn audition_gain(report: &Report, mode: AnalysisMode, track: &Track) -> Option<f64> {
+    let measurement = report.measurement(track)?;
     match mode {
         AnalysisMode::Track => normal_gain(measurement.integrated_lufs, measurement.true_peak_dbtp),
         AnalysisMode::Album => {
-            let album = report.batch.album.as_ref().ok()?;
+            let album = report.album.as_ref()?.as_ref().ok()?;
             normal_gain(album.integrated_lufs, album.true_peak_dbtp)
         }
     }
@@ -3227,20 +3342,15 @@ mod tests {
         let mut project = Project::new("Release".into());
         project.tracks.push(Track::new(dir.path().join("old.wav")));
         let id = project.id;
+        let mut report = Report::default();
+        report
+            .tracks
+            .insert(project.tracks[0].id, failed(&project.tracks[0], "old"));
         app.selected = Some(id);
         assert!(app.commit(|l| l.projects.push(project)));
-        app.reports.insert(
-            id,
-            Report {
-                batch: BatchAnalysis {
-                    tracks: vec![],
-                    album: Err("old".into()),
-                },
-                stamps: vec![],
-            },
-        );
+        app.reports.insert(id, report);
         let new_path = dir.path().join("new.wav");
-        app.edit_project(|p| p.tracks[0].path = new_path.clone(), true);
+        app.edit_project(|p| p.tracks[0].path = new_path.clone());
         assert!(!app.reports.contains_key(&id));
         assert_eq!(
             app.store.load().unwrap().projects[0].tracks[0].path,
@@ -3248,45 +3358,85 @@ mod tests {
         );
     }
 
-    fn audition_report(stamps: Vec<Option<FileStamp>>) -> Report {
-        let measurement = |loudness| {
-            Ok(audio::Measurement {
-                integrated_lufs: Some(loudness),
-                true_peak_dbtp: Some(-2.0),
-                duration_seconds: 10.0,
-                sample_rate: 48_000,
-                channels: 2,
-            })
+    // One second of a stereo 1 kHz tone, about `dbfs` LUFS.
+    fn write_tone(path: &std::path::Path, dbfs: f64) {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
         };
-        Report {
-            batch: BatchAnalysis {
-                tracks: vec![measurement(-9.0), measurement(-20.0)],
-                album: Ok(audio::AlbumMeasurement {
-                    integrated_lufs: Some(-11.5),
-                    true_peak_dbtp: Some(-2.0),
-                }),
-            },
-            stamps,
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        let amplitude = 10_f64.powf(dbfs / 20.0);
+        for frame in 0..48_000 {
+            let phase = std::f64::consts::TAU * 1000.0 * frame as f64 / 48_000.0;
+            let sample = (amplitude * phase.sin()) as f32;
+            writer.write_sample(sample).unwrap();
+            writer.write_sample(sample).unwrap();
         }
+        writer.finalize().unwrap();
+    }
+
+    // Analyzes the track's file, then pins the reported values so expected
+    // gains are exact. The file's real gating blocks still pool into albums.
+    fn measured(
+        track: &Track,
+        integrated_lufs: f64,
+        true_peak_dbtp: f64,
+        duration_seconds: f64,
+    ) -> TrackResult {
+        let mut analysis = audio::analyze_track(&track.path, &AtomicBool::new(false)).unwrap();
+        analysis.measurement = audio::Measurement {
+            integrated_lufs: Some(integrated_lufs),
+            true_peak_dbtp: Some(true_peak_dbtp),
+            duration_seconds,
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        TrackResult {
+            path: track.path.clone(),
+            stamp: file_stamp(&track.path).ok(),
+            analysis: Ok(analysis),
+        }
+    }
+
+    fn failed(track: &Track, error: &str) -> TrackResult {
+        TrackResult {
+            path: track.path.clone(),
+            stamp: file_stamp(&track.path).ok(),
+            analysis: Err(error.into()),
+        }
+    }
+
+    // Tracks measure −9 and −20 LUFS at −2 dBTP (gains −5 and +1 dB) and share
+    // a −11.5 LUFS album (gain −2.5 dB).
+    fn audition_report(tracks: &[Track]) -> Report {
+        let mut report = Report::default();
+        for (track, loudness) in tracks.iter().zip([-9.0, -20.0]) {
+            report
+                .tracks
+                .insert(track.id, measured(track, loudness, -2.0, 10.0));
+        }
+        report.album = Some(Ok(AlbumMeasurement {
+            integrated_lufs: Some(-11.5),
+            true_peak_dbtp: Some(-2.0),
+        }));
+        report
     }
 
     fn reorder_app() -> (tempfile::TempDir, LoudTraceApp) {
         let (dir, mut app) = test_app();
         let paths = [dir.path().join("first.wav"), dir.path().join("second.wav")];
-        std::fs::write(&paths[0], [0_u8; 16]).unwrap();
-        std::fs::write(&paths[1], [1_u8; 32]).unwrap();
+        write_tone(&paths[0], -9.0);
+        write_tone(&paths[1], -20.0);
         let mut project = Project::new("Release".into());
         project.tracks = paths.into_iter().map(Track::new).collect();
         let project_id = project.id;
         let track_id = project.tracks[0].id;
-        let stamps = project
-            .tracks
-            .iter()
-            .map(|t| file_stamp(&t.path).ok())
-            .collect();
+        let report = audition_report(&project.tracks);
         app.selected = Some(project_id);
         assert!(app.commit(|library| library.projects.push(project)));
-        app.reports.insert(project_id, audition_report(stamps));
+        app.reports.insert(project_id, report);
         // Keep a playback session without opening an audio device in the test process.
         app.audition = Some(Audition {
             session_id: Uuid::new_v4(),
@@ -3300,26 +3450,20 @@ mod tests {
 
     fn four_track_reorder_app() -> (tempfile::TempDir, LoudTraceApp) {
         let (dir, mut app) = reorder_app();
-        let paths = [dir.path().join("third.wav"), dir.path().join("fourth.wav")];
-        std::fs::write(&paths[0], [2_u8; 48]).unwrap();
-        std::fs::write(&paths[1], [3_u8; 64]).unwrap();
-        let stamps = paths.iter().map(|path| file_stamp(path).ok());
-        let report = app.reports.get_mut(&app.selected.unwrap()).unwrap();
-        report.stamps.extend(stamps);
-        for (integrated_lufs, duration_seconds) in [(-16.0, 30.0), (-12.0, 40.0)] {
-            report.batch.tracks.push(Ok(audio::Measurement {
-                integrated_lufs: Some(integrated_lufs),
-                true_peak_dbtp: Some(-4.0),
-                duration_seconds,
-                sample_rate: 44_100,
-                channels: 1,
-            }));
+        let mut tracks = Vec::new();
+        for (name, loudness) in [("third.wav", -16.0), ("fourth.wav", -12.0)] {
+            let path = dir.path().join(name);
+            write_tone(&path, loudness);
+            tracks.push(Track::new(path));
         }
-        assert!(app.commit(|library| {
-            library.projects[0]
+        let report = app.reports.get_mut(&app.selected.unwrap()).unwrap();
+        // Gains +2 and −2 dB.
+        for (track, (loudness, duration)) in tracks.iter().zip([(-16.0, 30.0), (-12.0, 40.0)]) {
+            report
                 .tracks
-                .extend(paths.into_iter().map(Track::new));
-        }));
+                .insert(track.id, measured(track, loudness, -4.0, duration));
+        }
+        assert!(app.commit(|library| library.projects[0].tracks.extend(tracks)));
         (dir, app)
     }
 
@@ -3532,14 +3676,7 @@ mod tests {
         let (_dir, mut app) = four_track_reorder_app();
         let id = app.selected.unwrap();
         let tracks = app.project().unwrap().tracks.clone();
-        let stamps = app.reports[&id].stamps.clone();
-        let measurements: Vec<_> = app.reports[&id]
-            .batch
-            .tracks
-            .iter()
-            .map(|measurement| format!("{measurement:?}"))
-            .collect();
-        let album = format!("{:?}", app.reports[&id].batch.album);
+        let original_report = format!("{:?}", app.reports[&id]);
         let session = app.audition.as_ref().unwrap().session_id;
         let gains = [-5.0, 1.0, 2.0, -2.0];
         for (source, before, expected) in [
@@ -3550,26 +3687,24 @@ mod tests {
         ] {
             app.reorder_track(id, tracks[source].id, before.map(|index| tracks[index].id));
             let saved = app.store.load().unwrap();
+            let project = app.project().unwrap();
             let report = &app.reports[&id];
             for (index, original) in expected.into_iter().enumerate() {
-                assert_eq!(app.project().unwrap().tracks[index].id, tracks[original].id);
+                let track = &project.tracks[index];
+                assert_eq!(track.id, tracks[original].id);
                 assert_eq!(saved.projects[0].tracks[index].id, tracks[original].id);
                 assert_eq!(saved.projects[0].tracks[index].path, tracks[original].path);
-                assert_eq!(report.stamps[index], stamps[original]);
                 assert_eq!(
-                    format!("{:?}", report.batch.tracks[index]),
-                    measurements[original]
-                );
-                assert_eq!(
-                    audition_gain(report, AnalysisMode::Track, index),
+                    audition_gain(report, AnalysisMode::Track, track),
                     Some(gains[original])
                 );
                 assert_eq!(
-                    audition_gain(report, AnalysisMode::Album, index),
+                    audition_gain(report, AnalysisMode::Album, track),
                     Some(-2.5)
                 );
             }
-            assert_eq!(format!("{:?}", report.batch.album), album);
+            // Results are keyed by track, so reordering never touches them.
+            assert_eq!(format!("{report:?}"), original_report);
             let audition = app.audition.as_ref().unwrap();
             assert_eq!(audition.session_id, session);
             assert_eq!(audition.project_id, id);
@@ -3582,10 +3717,14 @@ mod tests {
             assert!(app.notice.is_none());
         }
 
+        // Only the changed track loses its result, and with it the album.
         std::fs::write(&tracks[0].path, [4_u8; 96]).unwrap();
         app.last_file_check = Instant::now() - Duration::from_secs(2);
         app.check_changed_files();
-        assert!(!app.reports.contains_key(&id));
+        let report = &app.reports[&id];
+        assert!(report.result(&tracks[0]).is_none());
+        assert!(tracks[1..].iter().all(|t| report.measurement(t).is_some()));
+        assert!(report.album.is_none());
         assert!(app.audition.is_none());
         assert!(app.seek_preview.is_none());
     }
@@ -3618,8 +3757,7 @@ mod tests {
         let id = app.selected.unwrap();
         let tracks = app.project().unwrap().tracks.clone();
         let original_library = serde_json::to_value(&app.library).unwrap();
-        let original_batch = format!("{:?}", app.reports[&id].batch);
-        let original_stamps = app.reports[&id].stamps.clone();
+        let original_report = format!("{:?}", app.reports[&id]);
         let session = app.audition.as_ref().unwrap().session_id;
         let blocked_parent = dir.path().join("not_a_directory");
         std::fs::write(&blocked_parent, b"block saving").unwrap();
@@ -3655,8 +3793,7 @@ mod tests {
             serde_json::to_value(&app.library).unwrap(),
             original_library
         );
-        assert_eq!(format!("{:?}", app.reports[&id].batch), original_batch);
-        assert_eq!(app.reports[&id].stamps, original_stamps);
+        assert_eq!(format!("{:?}", app.reports[&id]), original_report);
         assert_eq!(app.audition.as_ref().unwrap().session_id, session);
         assert_eq!(app.seek_preview, Some(4.25));
         assert!(
@@ -3671,8 +3808,7 @@ mod tests {
         let id = app.selected.unwrap();
         let tracks = app.project().unwrap().tracks.clone();
         let original_library = serde_json::to_value(&app.library).unwrap();
-        let original_batch = format!("{:?}", app.reports[&id].batch);
-        let original_stamps = app.reports[&id].stamps.clone();
+        let original_report = format!("{:?}", app.reports[&id]);
         let session = app.audition.as_ref().unwrap().session_id;
         let saved_path = dir.path().join("projects.json");
         let original_saved = std::fs::read(&saved_path).unwrap();
@@ -3686,8 +3822,7 @@ mod tests {
                 serde_json::to_value(&app.library).unwrap(),
                 original_library
             );
-            assert_eq!(format!("{:?}", app.reports[&id].batch), original_batch);
-            assert_eq!(app.reports[&id].stamps, original_stamps);
+            assert_eq!(format!("{:?}", app.reports[&id]), original_report);
             assert_eq!(std::fs::read(&saved_path).unwrap(), original_saved);
             let audition = app.audition.as_ref().unwrap();
             assert_eq!(audition.session_id, session);
@@ -3711,7 +3846,7 @@ mod tests {
             let project = app.project().unwrap();
             let id = project.id;
             let original_tracks = project.tracks.clone();
-            let original_stamps = app.reports[&id].stamps.clone();
+            let original_report = format!("{:?}", app.reports[&id]);
             let session = app.audition.as_ref().unwrap().session_id;
             let ctx = egui::Context::default();
             crate::ui_style::configure_style(&ctx).expect("system fonts");
@@ -3726,15 +3861,25 @@ mod tests {
             }
             assert_eq!(saved.projects[0].mode, mode);
             let report = &app.reports[&id];
+            assert_eq!(format!("{report:?}"), original_report);
+            let tracks = &app.project().unwrap().tracks;
             assert_eq!(
-                report.stamps,
-                original_stamps.into_iter().rev().collect::<Vec<_>>()
+                audition_gain(report, AnalysisMode::Track, &tracks[0]),
+                Some(1.0)
             );
-            assert_eq!(audition_gain(report, AnalysisMode::Track, 0), Some(1.0));
-            assert_eq!(audition_gain(report, AnalysisMode::Track, 1), Some(-5.0));
-            assert_eq!(audition_gain(report, AnalysisMode::Album, 0), Some(-2.5));
-            assert_eq!(audition_gain(report, AnalysisMode::Album, 1), Some(-2.5));
-            let album = report.batch.album.as_ref().unwrap();
+            assert_eq!(
+                audition_gain(report, AnalysisMode::Track, &tracks[1]),
+                Some(-5.0)
+            );
+            assert_eq!(
+                audition_gain(report, AnalysisMode::Album, &tracks[0]),
+                Some(-2.5)
+            );
+            assert_eq!(
+                audition_gain(report, AnalysisMode::Album, &tracks[1]),
+                Some(-2.5)
+            );
+            let album = report.album.as_ref().unwrap().as_ref().unwrap();
             assert_eq!(album.integrated_lufs, Some(-11.5));
             assert_eq!(album.true_peak_dbtp, Some(-2.0));
             let audition = app.audition.as_ref().unwrap();
@@ -3747,7 +3892,7 @@ mod tests {
             app.dispatch(Action::Move(original_tracks[0].id, -1), &ctx);
             assert_eq!(app.project().unwrap().tracks[0].id, original_tracks[0].id);
             assert_eq!(
-                audition_gain(&app.reports[&id], mode, 0),
+                audition_gain(&app.reports[&id], mode, &original_tracks[0]),
                 Some(if mode == AnalysisMode::Track {
                     -5.0
                 } else {
@@ -3763,7 +3908,7 @@ mod tests {
     fn reordered_stamps_survive_file_checks_and_still_detect_later_edits() {
         let (_dir, mut app) = reorder_app();
         let id = app.selected.unwrap();
-        let track = app.project().unwrap().tracks[0].clone();
+        let [track, other] = app.project().unwrap().tracks.clone().try_into().unwrap();
         let session = app.audition.as_ref().unwrap().session_id;
         app.move_track(track.id, 1);
         app.last_file_check = Instant::now() - Duration::from_secs(2);
@@ -3776,7 +3921,8 @@ mod tests {
         std::fs::write(&track.path, [2_u8; 48]).unwrap();
         app.last_file_check = Instant::now() - Duration::from_secs(2);
         app.check_changed_files();
-        assert!(!app.reports.contains_key(&id));
+        assert!(app.reports[&id].result(&track).is_none());
+        assert!(app.reports[&id].measurement(&other).is_some());
         assert!(app.audition.is_none());
         assert!(app.seek_preview.is_none());
         assert_eq!(app.playback.state(), PlaybackState::Stopped);
@@ -3789,8 +3935,7 @@ mod tests {
         let id = app.selected.unwrap();
         let track_id = app.project().unwrap().tracks[0].id;
         let original_library = serde_json::to_value(&app.library).unwrap();
-        let original_batch = format!("{:?}", app.reports[&id].batch);
-        let original_stamps = app.reports[&id].stamps.clone();
+        let original_report = format!("{:?}", app.reports[&id]);
         let session = app.audition.as_ref().unwrap().session_id;
         let saved_path = dir.path().join("projects.json");
         let original_saved = std::fs::read(&saved_path).unwrap();
@@ -3804,8 +3949,7 @@ mod tests {
             serde_json::to_value(&app.library).unwrap(),
             original_library
         );
-        assert_eq!(format!("{:?}", app.reports[&id].batch), original_batch);
-        assert_eq!(app.reports[&id].stamps, original_stamps);
+        assert_eq!(format!("{:?}", app.reports[&id]), original_report);
         assert_eq!(std::fs::read(saved_path).unwrap(), original_saved);
         let audition = app.audition.as_ref().unwrap();
         assert_eq!(audition.session_id, session);
@@ -3827,8 +3971,7 @@ mod tests {
         let id = app.selected.unwrap();
         let tracks = app.project().unwrap().tracks.clone();
         let original_library = serde_json::to_value(&app.library).unwrap();
-        let original_batch = format!("{:?}", app.reports[&id].batch);
-        let original_stamps = app.reports[&id].stamps.clone();
+        let original_report = format!("{:?}", app.reports[&id]);
         let session = app.audition.as_ref().unwrap().session_id;
         for (track_id, delta) in [
             (tracks[0].id, -1),
@@ -3864,8 +4007,7 @@ mod tests {
             serde_json::to_value(app.store.load().unwrap()).unwrap(),
             original_library
         );
-        assert_eq!(format!("{:?}", app.reports[&id].batch), original_batch);
-        assert_eq!(app.reports[&id].stamps, original_stamps);
+        assert_eq!(format!("{:?}", app.reports[&id]), original_report);
         assert_eq!(app.audition.as_ref().unwrap().session_id, session);
         assert_eq!(app.seek_preview, Some(4.25));
         assert!(app.notice.is_none());
@@ -3875,12 +4017,13 @@ mod tests {
     fn reordering_keeps_track_errors_and_missing_stamps_with_their_sources() {
         let (_dir, mut app) = reorder_app();
         let id = app.selected.unwrap();
-        let track = app.project().unwrap().tracks[0].clone();
+        let [track, other] = app.project().unwrap().tracks.clone().try_into().unwrap();
         std::fs::remove_file(&track.path).unwrap();
         let report = app.reports.get_mut(&id).unwrap();
-        report.stamps[0] = None;
-        report.batch.tracks[0] = Err("Missing source".into());
-        report.batch.album = Err("Incomplete album".into());
+        report
+            .tracks
+            .insert(track.id, failed(&track, "Missing source"));
+        report.sync(&app.library.projects[0]);
         app.stop_playback();
 
         app.move_track(track.id, 1);
@@ -3889,71 +4032,76 @@ mod tests {
 
         let report = &app.reports[&id];
         assert_eq!(app.project().unwrap().tracks[1].id, track.id);
-        assert!(report.stamps[0].is_some());
-        assert!(report.stamps[1].is_none());
+        assert!(report.tracks[&track.id].stamp.is_none());
+        assert!(report.tracks[&other.id].stamp.is_some());
         assert_eq!(
-            report.batch.tracks[1].as_ref().unwrap_err(),
+            report.result(&track).unwrap().as_ref().unwrap_err(),
             "Missing source"
         );
-        assert_eq!(report.batch.album.as_ref().unwrap_err(), "Incomplete album");
-        assert_eq!(audition_gain(report, AnalysisMode::Track, 0), Some(1.0));
-        assert_eq!(audition_gain(report, AnalysisMode::Track, 1), None);
-        assert_eq!(audition_gain(report, AnalysisMode::Album, 0), None);
+        assert!(report.album.as_ref().unwrap().is_err());
+        assert_eq!(
+            audition_gain(report, AnalysisMode::Track, &other),
+            Some(1.0)
+        );
+        assert_eq!(audition_gain(report, AnalysisMode::Track, &track), None);
+        assert_eq!(audition_gain(report, AnalysisMode::Album, &other), None);
         assert!(app.notice.is_none());
     }
 
     #[test]
-    fn reordering_discards_inconsistent_cached_results_and_stops_audition() {
-        for invalid_stamps in [false, true] {
-            let (_dir, mut app) = reorder_app();
-            let id = app.selected.unwrap();
-            let track_id = app.project().unwrap().tracks[0].id;
-            let report = app.reports.get_mut(&id).unwrap();
-            if invalid_stamps {
-                report.stamps.pop();
-            } else {
-                report.batch.tracks.pop();
-            }
-
-            app.move_track(track_id, 1);
-
-            assert_eq!(app.project().unwrap().tracks[1].id, track_id);
-            assert_eq!(app.store.load().unwrap().projects[0].tracks[1].id, track_id);
-            assert!(!app.reports.contains_key(&id));
-            assert!(app.audition.is_none());
-            assert!(app.seek_preview.is_none());
-            assert_eq!(app.playback.state(), PlaybackState::Stopped);
-        }
-    }
-
-    #[test]
     fn audition_uses_track_peak_limit_or_shared_album_gain() {
-        let mut report = audition_report(vec![]);
-        assert_eq!(audition_gain(&report, AnalysisMode::Track, 0), Some(-5.0));
-        assert_eq!(audition_gain(&report, AnalysisMode::Track, 1), Some(1.0));
-        assert_eq!(audition_gain(&report, AnalysisMode::Album, 0), Some(-2.5));
-        assert_eq!(audition_gain(&report, AnalysisMode::Album, 1), Some(-2.5));
-        report.batch.tracks[1] = Err("Missing file".into());
-        assert_eq!(audition_gain(&report, AnalysisMode::Album, 1), None);
-        report.batch.album = Err("Incomplete album".into());
-        assert_eq!(audition_gain(&report, AnalysisMode::Album, 0), None);
-        assert_eq!(audition_gain(&report, AnalysisMode::Track, 0), Some(-5.0));
+        let (_dir, mut app) = reorder_app();
+        let id = app.selected.unwrap();
+        let [first, second] = app.project().unwrap().tracks.clone().try_into().unwrap();
+        let report = app.reports.get_mut(&id).unwrap();
+        assert_eq!(
+            audition_gain(report, AnalysisMode::Track, &first),
+            Some(-5.0)
+        );
+        assert_eq!(
+            audition_gain(report, AnalysisMode::Track, &second),
+            Some(1.0)
+        );
+        assert_eq!(
+            audition_gain(report, AnalysisMode::Album, &first),
+            Some(-2.5)
+        );
+        assert_eq!(
+            audition_gain(report, AnalysisMode::Album, &second),
+            Some(-2.5)
+        );
+        report
+            .tracks
+            .insert(second.id, failed(&second, "Missing file"));
+        assert_eq!(audition_gain(report, AnalysisMode::Album, &second), None);
+        report.album = Some(Err("Incomplete album".into()));
+        assert_eq!(audition_gain(report, AnalysisMode::Album, &first), None);
+        assert_eq!(
+            audition_gain(report, AnalysisMode::Track, &first),
+            Some(-5.0)
+        );
+        // A result never describes a track that now points at another file.
+        let relinked = Track {
+            path: first.path.with_file_name("other.wav"),
+            ..first.clone()
+        };
+        assert_eq!(audition_gain(report, AnalysisMode::Track, &relinked), None);
     }
 
     #[test]
     fn playback_revalidates_files_without_waiting_for_periodic_check() {
         let (dir, mut app) = test_app();
         let path = dir.path().join("song.wav");
-        std::fs::write(&path, [0_u8; 16]).unwrap();
+        write_tone(&path, -9.0);
         let mut project = Project::new("Release".into());
         let track = Track::new(path.clone());
         let track_id = track.id;
         project.tracks.push(track);
         let id = project.id;
+        let report = audition_report(&project.tracks);
         app.selected = Some(id);
         app.commit(|l| l.projects.push(project));
-        app.reports
-            .insert(id, audition_report(vec![file_stamp(&path).ok()]));
+        app.reports.insert(id, report);
         std::fs::write(&path, [1_u8; 32]).unwrap();
         app.start_playback(track_id);
         assert_eq!(app.playback.state(), PlaybackState::Stopped);
@@ -3963,13 +4111,196 @@ mod tests {
     }
 
     #[test]
-    fn monitor_controls_leave_normalization_and_projects_unchanged() {
-        let (_dir, mut app) = test_app();
-        let project = Project::new("Release".into());
+    fn another_tracks_file_changing_keeps_individual_playback_but_not_album_playback() {
+        let (_dir, mut app) = reorder_app();
+        let id = app.selected.unwrap();
+        let [first, second] = app.project().unwrap().tracks.clone().try_into().unwrap();
+        let session = app.audition.as_ref().unwrap().session_id;
+        std::fs::write(&second.path, [1_u8; 32]).unwrap();
+        app.last_file_check = Instant::now() - Duration::from_secs(2);
+        app.check_changed_files();
+        assert_eq!(app.audition.as_ref().unwrap().session_id, session);
+        assert!(app.reports[&id].measurement(&first).is_some());
+        assert!(app.reports[&id].result(&second).is_none());
+        assert!(app.notice.as_ref().unwrap().contains("Analyze again"));
+
+        // The shared album gain needs every track.
+        let ctx = egui::Context::default();
+        app.dispatch(Action::Mode(AnalysisMode::Album), &ctx);
+        assert!(app.audition.is_none());
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .contains("unavailable in this mode")
+        );
+    }
+
+    #[test]
+    fn editing_one_track_keeps_the_others_and_individual_playback() {
+        for mode in [AnalysisMode::Track, AnalysisMode::Album] {
+            let (dir, mut app) = reorder_app();
+            assert!(app.commit(|library| library.projects[0].mode = mode));
+            let id = app.selected.unwrap();
+            let session = app.audition.as_ref().unwrap().session_id;
+            let added = dir.path().join("added.wav");
+            write_tone(&added, -14.0);
+            app.add_paths(vec![added]);
+
+            let tracks = app.project().unwrap().tracks.clone();
+            let report = &app.reports[&id];
+            assert!(report.measurement(&tracks[0]).is_some());
+            assert!(report.measurement(&tracks[1]).is_some());
+            assert!(report.result(&tracks[2]).is_none());
+            assert!(report.album.is_none());
+            let pending: Vec<_> = unmeasured(Some(report), app.project().unwrap())
+                .map(|t| t.id)
+                .collect();
+            assert_eq!(pending, [tracks[2].id]);
+            assert_eq!(
+                app.audition.as_ref().map(|a| a.session_id),
+                (mode == AnalysisMode::Track).then_some(session)
+            );
+
+            if mode == AnalysisMode::Track {
+                let ctx = egui::Context::default();
+                app.dispatch(Action::Remove(tracks[0].id), &ctx);
+                assert!(app.audition.is_none());
+                assert!(!app.reports[&id].tracks.contains_key(&tracks[0].id));
+                assert!(app.reports[&id].measurement(&tracks[1]).is_some());
+            }
+        }
+    }
+
+    fn analyze(app: &mut LoudTraceApp, ctx: &egui::Context) -> usize {
+        app.start_analysis(ctx);
+        let total = app.worker.as_ref().unwrap().total;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.worker.is_some() {
+            assert!(Instant::now() < deadline, "Analysis did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+            app.poll_worker();
+        }
+        total
+    }
+
+    // The album pooled from cached tracks must equal analyzing every file at once.
+    fn assert_album_matches_batch(app: &LoudTraceApp, paths: &[PathBuf]) {
+        let expected = audio::analyze_files(paths, |_, _| {}, &AtomicBool::new(false))
+            .album
+            .unwrap();
+        let report = &app.reports[&app.selected.unwrap()];
+        let actual = report.album.as_ref().unwrap().as_ref().unwrap();
+        let difference = actual.integrated_lufs.unwrap() - expected.integrated_lufs.unwrap();
+        assert!(
+            difference.abs() < 1e-9,
+            "Pooled album differs by {difference} LU"
+        );
+        assert_eq!(actual.true_peak_dbtp, expected.true_peak_dbtp);
+    }
+
+    #[test]
+    fn analysis_measures_only_new_or_changed_tracks_and_pools_the_album() {
+        let (dir, mut app) = test_app();
+        let ctx = egui::Context::default();
+        let mut paths: Vec<_> = [-18.0, -26.0, -12.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, loudness)| {
+                let path = dir.path().join(format!("track-{index}.wav"));
+                write_tone(&path, loudness);
+                path
+            })
+            .collect();
+        let mut project = Project::new("Release".into());
+        project.mode = AnalysisMode::Album;
+        project.tracks = paths.iter().cloned().map(Track::new).collect();
         let id = project.id;
         app.selected = Some(id);
-        app.commit(|l| l.projects.push(project));
-        app.reports.insert(id, audition_report(vec![]));
+        assert!(app.commit(|library| library.projects.push(project)));
+
+        assert_eq!(analyze(&mut app, &ctx), 3);
+        assert_album_matches_batch(&app, &paths);
+
+        // Relinking one track measures only that track, then pools the album again.
+        paths[1] = dir.path().join("replacement.wav");
+        write_tone(&paths[1], -30.0);
+        app.edit_project(|p| p.tracks[1].path = paths[1].clone());
+        assert!(app.reports[&id].album.is_none());
+        assert_eq!(analyze(&mut app, &ctx), 1);
+        assert_album_matches_batch(&app, &paths);
+
+        // Re-exporting a file on disk measures only that file again.
+        write_tone(&paths[0], -20.0);
+        // Some filesystems store coarse modification times.
+        std::fs::File::options()
+            .write(true)
+            .open(&paths[0])
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        app.last_file_check = Instant::now() - Duration::from_secs(2);
+        app.check_changed_files();
+        let first = app.project().unwrap().tracks[0].clone();
+        assert!(app.reports[&id].result(&first).is_none());
+        assert_eq!(analyze(&mut app, &ctx), 1);
+        assert_album_matches_batch(&app, &paths);
+
+        // Removing a track needs no analysis at all.
+        app.edit_project(|p| {
+            p.tracks.pop();
+        });
+        paths.pop();
+        assert!(app.worker.is_none());
+        assert_album_matches_batch(&app, &paths);
+
+        // With every track current, Analyze measures all of them again.
+        assert_eq!(analyze(&mut app, &ctx), 2);
+        assert_album_matches_batch(&app, &paths);
+    }
+
+    #[test]
+    fn cancelled_analysis_keeps_tracks_that_finished() {
+        let (_dir, mut app) = reorder_app();
+        app.stop_playback();
+        let id = app.selected.unwrap();
+        let [first, second] = app.project().unwrap().tracks.clone().try_into().unwrap();
+        let mut results = app.reports.remove(&id).unwrap().tracks;
+        let (tx, rx) = mpsc::channel();
+        app.worker = Some(Worker {
+            project_id: id,
+            rx,
+            cancelled: Arc::new(AtomicBool::new(true)),
+            completed: 0,
+            total: 2,
+        });
+        // A result for a file the track no longer points at is never attached.
+        let mut stale = results.remove(&first.id).unwrap();
+        stale.path = first.path.with_file_name("old.wav");
+        tx.send(WorkerEvent::Track(first.id, Box::new(stale)))
+            .unwrap();
+        tx.send(WorkerEvent::Track(
+            second.id,
+            Box::new(results.remove(&second.id).unwrap()),
+        ))
+        .unwrap();
+        tx.send(WorkerEvent::Finished).unwrap();
+        app.poll_worker();
+
+        assert!(app.worker.is_none());
+        let report = &app.reports[&id];
+        assert!(report.measurement(&second).is_some());
+        assert!(!report.tracks.contains_key(&first.id));
+        assert!(report.album.is_none());
+        assert!(app.notice.as_ref().unwrap().contains("keep their results"));
+    }
+
+    #[test]
+    fn monitor_controls_leave_normalization_and_projects_unchanged() {
+        let (_dir, mut app) = reorder_app();
+        app.stop_playback();
+        let id = app.selected.unwrap();
+        let track = app.project().unwrap().tracks[0].clone();
         let ctx = egui::Context::default();
         crate::ui_style::configure_style(&ctx).expect("system fonts");
         app.dispatch(Action::Volume(0.7), &ctx);
@@ -3977,7 +4308,7 @@ mod tests {
         assert!(app.muted);
         assert_eq!(app.monitor_volume, 0.7);
         assert_eq!(
-            audition_gain(&app.reports[&id], AnalysisMode::Track, 0),
+            audition_gain(&app.reports[&id], AnalysisMode::Track, &track),
             Some(-5.0)
         );
         app.dispatch(Action::Mode(AnalysisMode::Album), &ctx);
@@ -3999,18 +4330,13 @@ mod tests {
         let mut project = Project::new("Release".into());
         project.tracks.push(Track::new(path.clone()));
         let id = project.id;
+        let mut report = Report::default();
+        report
+            .tracks
+            .insert(project.tracks[0].id, failed(&project.tracks[0], "old"));
         app.selected = Some(id);
         app.commit(|l| l.projects.push(project));
-        app.reports.insert(
-            id,
-            Report {
-                batch: BatchAnalysis {
-                    tracks: vec![],
-                    album: Err("old".into()),
-                },
-                stamps: vec![file_stamp(&path).ok()],
-            },
-        );
+        app.reports.insert(id, report);
         app.audition = Some(Audition {
             session_id: Uuid::new_v4(),
             project_id: id,

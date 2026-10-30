@@ -216,8 +216,9 @@ fn validate_library(library: &Library) -> Result<(), String> {
     Ok(())
 }
 
-// This stamp detects ordinary file changes for UI invalidation. It is not a
-// content hash; every explicit analysis must read the audio file again.
+// This stamp detects ordinary file changes. A track's result is reused only
+// while its stamp is unchanged; it is not a content hash, so re-analyzing a
+// project must read every audio file again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileStamp {
     pub len: u64,

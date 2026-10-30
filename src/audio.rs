@@ -44,8 +44,11 @@ pub struct DecodedAudio {
     pub frames: u64,
 }
 
-struct AnalyzedTrack {
-    measurement: Measurement,
+// One track's result plus its gating-block energies, which let the track join
+// an album later without decoding the file again.
+#[derive(Debug)]
+pub struct TrackAnalysis {
+    pub measurement: Measurement,
     loudness: EbuR128,
 }
 
@@ -88,7 +91,7 @@ impl Meters {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<AnalyzedTrack, String> {
+    fn finish(mut self) -> Result<TrackAnalysis, String> {
         if self.frames == 0 {
             return Err("The file contains no decoded audio frames.".into());
         }
@@ -121,7 +124,7 @@ impl Meters {
             sample_rate: self.loudness.rate(),
             channels: self.loudness.channels(),
         };
-        Ok(AnalyzedTrack {
+        Ok(TrackAnalysis {
             measurement,
             loudness: self.loudness,
         })
@@ -148,7 +151,7 @@ pub fn analyze_files(
     let mut tracks = Vec::with_capacity(paths.len());
     let mut successful = Vec::with_capacity(paths.len());
     for (index, path) in paths.iter().enumerate() {
-        match analyze_file(path, cancelled) {
+        match analyze_track(path, cancelled) {
             Ok(track) => {
                 tracks.push(Ok(track.measurement.clone()));
                 successful.push(track);
@@ -159,8 +162,6 @@ pub fn analyze_files(
     }
     let album = if cancelled.load(Ordering::Relaxed) {
         Err("Analysis cancelled.".into())
-    } else if tracks.is_empty() {
-        Err("Add at least one track to analyze an album.".into())
     } else if successful.len() != tracks.len() {
         Err("Every track must be analyzed successfully before calculating the album.".into())
     } else {
@@ -169,7 +170,15 @@ pub fn analyze_files(
     BatchAnalysis { tracks, album }
 }
 
-fn album_measurement(tracks: &[AnalyzedTrack]) -> Result<AlbumMeasurement, String> {
+// Pools already analyzed tracks, so changing one track never requires decoding
+// the others again. The result does not depend on track order.
+pub fn album_measurement<'a>(
+    tracks: impl IntoIterator<Item = &'a TrackAnalysis>,
+) -> Result<AlbumMeasurement, String> {
+    let tracks: Vec<_> = tracks.into_iter().collect();
+    if tracks.is_empty() {
+        return Err("Add at least one track to analyze an album.".into());
+    }
     // REFERENCE MODEL, not Spotify's official album implementation. Spotify
     // publicly specifies a common album gain but does not publish its complete
     // album-reference calculation:
@@ -191,7 +200,7 @@ fn album_measurement(tracks: &[AnalyzedTrack]) -> Result<AlbumMeasurement, Strin
     })
 }
 
-fn analyze_file(path: &Path, cancelled: &AtomicBool) -> Result<AnalyzedTrack, String> {
+pub fn analyze_track(path: &Path, cancelled: &AtomicBool) -> Result<TrackAnalysis, String> {
     let mut meters: Option<Meters> = None;
     decode_pcm(path, cancelled, |sample_rate, channels, samples| {
         if meters.is_none() {
@@ -556,7 +565,7 @@ mod tests {
             .collect()
     }
 
-    fn measure(rate: u32, channels: u32, samples: &[f64], chunk_frames: usize) -> AnalyzedTrack {
+    fn measure(rate: u32, channels: u32, samples: &[f64], chunk_frames: usize) -> TrackAnalysis {
         let mut meters = Meters::new(channels, rate).unwrap();
         for chunk in samples.chunks(chunk_frames * channels as usize) {
             meters.push(chunk).unwrap();
@@ -706,6 +715,38 @@ mod tests {
         let quiet = measure(96_000, 2, &tone(96_000, 2, 2.0, -43.0, 1000.0), 1024);
         let album = album_measurement(&[loud, quiet]).unwrap();
         near(album.integrated_lufs.unwrap(), -23.0, 0.06);
+    }
+
+    #[test]
+    fn album_pools_separately_analyzed_tracks_in_any_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = [(-18.0, 1.3), (-26.0, 2.1), (-12.0, 0.9)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (dbfs, seconds))| {
+                let path = temp.path().join(format!("{index}.wav"));
+                write_float_wav(&path, 48_000, 2, &tone(48_000, 2, seconds, dbfs, 1000.0));
+                path
+            })
+            .collect();
+        let cancelled = AtomicBool::new(false);
+        let batch = analyze_files(&paths, |_, _| {}, &cancelled).album.unwrap();
+        let tracks: Vec<_> = paths
+            .iter()
+            .map(|path| analyze_track(path, &cancelled).unwrap())
+            .collect();
+        let pooled = album_measurement(tracks.iter().rev()).unwrap();
+        near(
+            pooled.integrated_lufs.unwrap(),
+            batch.integrated_lufs.unwrap(),
+            1e-9,
+        );
+        assert_eq!(pooled.true_peak_dbtp, batch.true_peak_dbtp);
+        let without_last = album_measurement(&tracks[..2]).unwrap();
+        assert!(
+            (without_last.integrated_lufs.unwrap() - batch.integrated_lufs.unwrap()).abs() > 0.5
+        );
+        assert!(album_measurement(&tracks[..0]).is_err());
     }
 
     #[test]
