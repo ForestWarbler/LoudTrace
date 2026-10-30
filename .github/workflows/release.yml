@@ -1,0 +1,108 @@
+name: Release
+
+# Pushing a version tag such as v1.0.0 builds every platform and publishes a
+# GitHub release. Its notes come from that version's section in CHANGELOG.md.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable --no-self-update && rustup default stable
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: sh scripts/bundle-macos.sh universal
+      - name: Package
+        run: |
+          ditto -c -k --keepParent target/universal/LoudTrace.app \
+            "LoudTrace-$GITHUB_REF_NAME-macos-universal.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: LoudTrace-*-macos-universal.zip
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable --no-self-update && rustup default stable
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item target/release/loudtrace.exe package/LoudTrace.exe
+          Compress-Archive -Path package/LoudTrace.exe `
+            -DestinationPath "LoudTrace-$env:GITHUB_REF_NAME-windows-x86_64.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: LoudTrace-*-windows-x86_64.zip
+          if-no-files-found: error
+
+  linux:
+    # The oldest supported runner keeps the binary compatible with older glibc.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - run: rustup update stable --no-self-update && rustup default stable
+      - run: cargo build --release --locked
+      - name: Package
+        run: tar -czf "LoudTrace-$GITHUB_REF_NAME-linux-x86_64.tar.gz" -C target/release loudtrace
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: LoudTrace-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum * > SHA256SUMS.txt
+      - name: Write release notes
+        run: |
+          awk -v heading="## $GITHUB_REF_NAME" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "CHANGELOG.md has no section for $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          cat >> notes.md <<'NOTES'
+
+          ### Downloads
+
+          - **macOS 11 or later** (Apple silicon and Intel): unzip and move LoudTrace.app to Applications. The app is not notarized, so on first launch Control-click it and choose **Open**.
+          - **Windows 10 or later** (x86_64): unzip and run LoudTrace.exe. If SmartScreen warns about an unrecognized app, choose **More info** and then **Run anyway**.
+          - **Linux** (x86_64): extract and run `loudtrace`. Requires the ALSA runtime library (`libasound2`).
+
+          `SHA256SUMS.txt` lists checksums for every download.
+          NOTES
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "LoudTrace $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag

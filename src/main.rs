@@ -1,3 +1,6 @@
+// Release builds on Windows open only the app window, without a console.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod system_fonts;
 mod track_drag;

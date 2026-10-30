@@ -8,6 +8,8 @@ LoudTrace is a desktop app for analyzing track and album loudness and previewing
 
 ![LoudTrace showing an analyzed ten-track album with each track's integrated loudness, true peak, predicted Spotify Normal gain, and resulting playback loudness](assets/screenshot.png)
 
+Download LoudTrace for macOS, Windows or Linux from the [latest release](https://github.com/ForestWarbler/LoudTrace/releases/latest). Changes in each version are listed in [CHANGELOG.md](CHANGELOG.md).
+
 To build locally, install Rust 1.95 or newer and your platform's native build tools. Linux also requires ALSA development libraries and `pkg-config`. From the project root, run:
 
 ```sh
